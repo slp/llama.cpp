@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-kompute.h"
+#include "ggml-common.h"
 
 // These are generated at build time by cmake custom command
 #include "shaderop_scale.h"
@@ -20,6 +21,7 @@
 #include "shaderop_mul_mat_q8_0.h"
 #include "shaderop_mul_mat_q4_0.h"
 #include "shaderop_mul_mat_q4_1.h"
+#include "shaderop_mul_mat_q4_k.h"
 #include "shaderop_mul_mat_q6_k.h"
 #include "shaderop_mul_mat_mat_f32.h"
 #include "shaderop_getrows_f32.h"
@@ -1098,11 +1100,11 @@ static void ggml_vk_mul_mat_q6_k(
     std::shared_ptr<kp::Algorithm> s_algo = nullptr;
     if (!komputeManager()->hasAlgorithm(__func__)) {
         const uint32_t local_x = ggml_vk_current_device().subgroupSize * 2;
-        s_algo = komputeManager()->algorithm<uint32_t, PushConstants>(__func__, s_kompute_context->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)}, {local_x}, {pushConsts});
+        s_algo = komputeManager()->algorithm<uint32_t, PushConstants>(__func__, s_kompute_context->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 3)/4), unsigned(ne11), unsigned(ne12)}, {local_x}, {pushConsts});
     } else {
         s_algo = komputeManager()->getAlgorithm(__func__);
         s_algo->setTensors({inA, inB, out});
-        s_algo->setWorkgroup({unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)});
+        s_algo->setWorkgroup({unsigned((ne01 + 3)/4), unsigned(ne11), unsigned(ne12)});
         s_algo->setPushConstants<PushConstants>({pushConsts});
         s_algo->updateDescriptors(s_kompute_context->pool.get());
     }
@@ -1412,12 +1414,260 @@ static bool ggml_vk_supports_op(const struct ggml_tensor * op) {
     return false;
 }
 
+#define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
+static void ggml_vk_print_matrix_area(const void * data, ggml_type type, int ne0, int ne1, int i0, int i1, int i2) {
+    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16) {
+        return;
+    }
+    i0 = std::max(i0, 5);
+    i1 = std::max(i1, 5);
+    i2 = std::max(i2, 0);
+    fprintf(stderr, "         ");
+    for (int idx1 = i1 - 5; idx1 < i1 + 5; idx1++) {
+        fprintf(stderr, "%7d ", idx1);
+    }
+    fprintf(stderr, "\n");
+    for (int idx0 = i0 - 5; idx0 < i0 + 5; idx0++) {
+        fprintf(stderr, "%7d: ", idx0);
+        for (int idx1 = i1 - 5; idx1 < i1 + 5; idx1++) {
+            if (idx0 >= 0 && idx0 < ne0 && idx1 >= 0 && idx1 < ne1) {
+                float val;
+                if (type == GGML_TYPE_F32) {
+                    val = *((const float *) data + i2*ne1*ne0 + idx1*ne0 + idx0);
+                } else if (type == GGML_TYPE_F16) {
+                    val = ggml_fp16_to_fp32(*((const ggml_fp16_t *) data + i2*ne1*ne0 + idx1*ne0 + idx0));
+                } else {
+                    GGML_ABORT("fatal error");
+                }
+                fprintf(stderr, "% 7.2f ", val);
+            } else {
+                fprintf(stderr, "        ");
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+static ggml_backend_buffer_t ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
+
+static void ggml_vk_test_dequant_matmul(ggml_kompute_context * ctx, size_t m, size_t n, size_t k, size_t batch, size_t num_it, size_t split_k, size_t shader_size, ggml_type quant) {
+    VK_LOG_DEBUG("ggml_vk_test_dequant_matmul(" << m << ", " << n << ", " << k << ", " << batch << ", " << num_it << ", " << split_k << ", " << ggml_type_name(quant) << ")");
+    const size_t x_ne = m * k * batch;
+    const size_t y_ne = k * n * batch;
+    const size_t d_ne = m * n * batch;
+
+    const size_t x_sz = sizeof(float) * x_ne;
+    const size_t y_sz = sizeof(float) * y_ne;
+    const size_t qx_sz = x_ne * ggml_type_size(quant)/ggml_blck_size(quant);
+    const size_t d_sz = sizeof(float) * d_ne;
+    float * x = (float *) malloc(x_sz);
+    float * y = (float *) malloc(y_sz);
+    void * qx = malloc(qx_sz);
+    //vk_buffer qx_buf = ggml_vk_create_buffer_check(ctx->device, qx_sz, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    //vk_buffer y_buf = ggml_vk_create_buffer_check(ctx->device, y_sz, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    //vk_buffer d_buf = ggml_vk_create_buffer_check(ctx->device, d_sz, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    float * d = (float *) malloc(d_sz);
+    float * d_chk = (float *) malloc(d_sz);
+
+    for (size_t i = 0; i < x_ne; i++) {
+        x[i] = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+    }
+
+    ggml_quantize_chunk(quant, x, qx, 0, 1, x_ne, nullptr);
+
+    for (size_t i = 0; i < y_ne; i++) {
+        // y[i] = rand() / (float)RAND_MAX;
+        y[i] = (i % k == i / k) ? 1.0f : 0.0f;
+    }
+
+    ggml_init_params iparams = {
+        /*.mem_size   =*/ 1024*1024*1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ggml_ctx = ggml_init(iparams);
+
+    ggml_tensor * src0 = ggml_new_tensor_3d(ggml_ctx, quant, k, m, batch);
+    ggml_tensor * src1 = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, k, n, batch);
+    ggml_tensor * dst = ggml_mul_mat(ggml_ctx, src0, src1);
+
+    //src0->buffer = ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_kompute_buffer_type(0), qx_sz);
+    //src1->buffer = ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_kompute_buffer_type(0), y_sz);
+    //dst->buffer = ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_kompute_buffer_type(0), d_sz);
+
+/*
+    src0->data = qx;
+    src1->data = y;
+    dst->data = d;
+*/
+
+    const int32_t ne00 = src0 ? src0->ne[0] : 0;
+    const int32_t ne01 = src0 ? src0->ne[1] : 0;
+    const int32_t ne02 = src0 ? src0->ne[2] : 0;
+    const int32_t ne03 = src0 ? src0->ne[3] : 0;
+
+    const uint32_t nb00 = src0 ? src0->nb[0] : 0;
+    const uint32_t nb01 = src0 ? src0->nb[1] : 0;
+    const uint32_t nb02 = src0 ? src0->nb[2] : 0;
+    const uint32_t nb03 = src0 ? src0->nb[3] : 0;
+
+    const int32_t ne10 = src1 ? src1->ne[0] : 0;
+    const int32_t ne11 = src1 ? src1->ne[1] : 0;
+    const int32_t ne12 = src1 ? src1->ne[2] : 0;
+    const int32_t ne13 = src1 ? src1->ne[3] : 0;
+
+    const uint32_t nb10 = src1 ? src1->nb[0] : 0;
+    const uint32_t nb11 = src1 ? src1->nb[1] : 0;
+    const uint32_t nb12 = src1 ? src1->nb[2] : 0;
+    const uint32_t nb13 = src1 ? src1->nb[3] : 0;
+
+    const int32_t ne0 = dst ? dst->ne[0] : 0;
+    const int32_t ne1 = dst ? dst->ne[1] : 0;
+    const int32_t ne2 = dst ? dst->ne[2] : 0;
+//            const int32_t ne3 = dst ? dst->ne[3] : 0;
+
+    const uint32_t nb0 = dst ? dst->nb[0] : 0;
+    const uint32_t nb1 = dst ? dst->nb[1] : 0;
+    const uint32_t nb2 = dst ? dst->nb[2] : 0;
+    const uint32_t nb3 = dst ? dst->nb[3] : 0;
+
+    const uint32_t r2 = ne12/ne02;
+    const uint32_t r3 = ne13/ne03;
+
+    const static auto spirv = getSpirvShader(kp::shader_data::op_mul_mat_q4_k_comp_spv,
+        kp::shader_data::op_mul_mat_q4_k_comp_spv_len);
+
+    struct PushConstants {
+        uint32_t inAOff, inBOff, outOff;
+        int32_t ne00, ne10, ne0, ne1, ne01, ne02, ne12, r2, r3;
+    } pushConsts {
+        0, 0, 0,
+        ne00, ne10, ne0, ne1, ne01, ne02, ne12, r2, r3
+    };
+
+    const static std::shared_ptr<kp::Tensor> nullTensor = nullptr;
+    uint32_t off_src0 = 0;
+    uint32_t off_src1 = 0;
+    uint32_t off_dst  = 0;
+
+    ggml_vk_memory qx_buf = ggml_vk_allocate(qx_sz);
+    memcpy(qx_buf.data, qx, qx_sz);
+    const std::shared_ptr<kp::Tensor>& inA = komputeManager()->tensor(
+        qx_buf.data,
+        ggml_nelements(src0),
+        ggml_nbytes(src0), kp::Tensor::TensorDataTypes::eFloat,
+        qx_buf.primaryMemory, qx_buf.primaryBuffer,
+        qx_buf.stagingMemory, qx_buf.stagingBuffer,
+        0);
+
+    ggml_vk_memory y_buf = ggml_vk_allocate(y_sz);
+    memcpy(y_buf.data, y, y_sz);
+    const std::shared_ptr<kp::Tensor>& inB = komputeManager()->tensor(
+        y_buf.data,
+        ggml_nelements(src1),
+        ggml_nbytes(src1), kp::Tensor::TensorDataTypes::eFloat,
+        y_buf.primaryMemory, y_buf.primaryBuffer,
+        y_buf.stagingMemory, y_buf.stagingBuffer,
+        0);
+
+    ggml_vk_memory d_buf = ggml_vk_allocate(d_sz);
+    const std::shared_ptr<kp::Tensor>& out = komputeManager()->tensor(
+        d_buf.data,
+        ggml_nelements(dst),
+        ggml_nbytes(dst), kp::Tensor::TensorDataTypes::eFloat,
+        d_buf.primaryMemory, d_buf.primaryBuffer,
+        d_buf.stagingMemory, d_buf.stagingBuffer,
+        0);
+
+    VK_LOG_DEBUG("ggml_vk_test_dequant_matmul(" << qx_sz << ", " << y_sz << ", " << d_sz << ")\n");
+    VK_LOG_DEBUG("ne00: " << ne00);
+    std::shared_ptr<kp::Sequence> seq = komputeManager()->sequence();
+
+    std::shared_ptr<kp::Algorithm> s_algo = nullptr;
+    if (!komputeManager()->hasAlgorithm(__func__)) {
+        const uint32_t local_x = ggml_vk_current_device().subgroupSize * 2;
+        s_algo = komputeManager()->algorithm<uint32_t, PushConstants>(__func__, s_kompute_context->pool.get(), {inA, inB, out}, spirv, {unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)}, {local_x}, {pushConsts});
+    } else {
+        s_algo = komputeManager()->getAlgorithm(__func__);
+        s_algo->setTensors({inA, inB, out});
+        s_algo->setWorkgroup({unsigned((ne01 + 1)/2), unsigned(ne11), unsigned(ne12)});
+        s_algo->setPushConstants<PushConstants>({pushConsts});
+        s_algo->updateDescriptors(s_kompute_context->pool.get());
+    }
+    seq->record<kp::OpAlgoDispatch>(s_algo);
+    seq->evalAsync();
+    seq->evalAwait();
+
+    VK_LOG_DEBUG("after dispatch");
+
+    ggml_tensor * src0_ggml = ggml_new_tensor_3d(ggml_ctx, quant, k, m, batch);
+    ggml_tensor * src1_ggml = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, k, n, batch);
+    ggml_tensor * tensor_ggml = ggml_mul_mat(ggml_ctx, src0_ggml, src1_ggml);
+
+    src0_ggml->data = qx;
+    src1_ggml->data = y;
+    tensor_ggml->data = d_chk;
+
+    ggml_cgraph * cgraph = ggml_new_graph(ggml_ctx);
+    ggml_build_forward_expand(cgraph, tensor_ggml);
+
+    ggml_graph_compute_with_ctx(ggml_ctx, cgraph, 1);
+
+    ggml_free(ggml_ctx);
+
+    double avg_err = 0.0;
+    int first_err_n = -1;
+    int first_err_m = -1;
+    int first_err_b = -1;
+
+    komputeManager()->sequence()->eval<kp::OpTensorSyncLocal>({out});
+    memcpy(d, (const char*) d_buf.data, d_sz);
+
+    VK_LOG_DEBUG("after copy");
+
+    for (size_t i = 0; i < m*n*batch; i++) {
+        double err = std::fabs(d[i] - d_chk[i]);
+        avg_err += err;
+
+        if (err > 0.05f && first_err_n == -1) {
+            first_err_b = i / (m * n);
+            first_err_n = (i % (m * n)) / m;
+            first_err_m = (i % (m * n)) % m;
+        }
+    }
+
+    avg_err /= m * n;
+
+    std::cerr << "TEST " << " m=" << m << " n=" << n << " k=" << k << " batch=" << batch << " split_k=" << split_k << " matmul avg_err=" << avg_err << std::endl;
+
+    if (avg_err > 0.01 || std::isnan(avg_err)) {
+        std::cerr << "Actual result: " << std::endl << std::endl;
+        ggml_vk_print_matrix_area(d, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
+        std::cerr << "Expected result: " << std::endl << std::endl;
+        ggml_vk_print_matrix_area(d_chk, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
+    }
+
+}
+
+static void ggml_vk_run_tests(struct ggml_kompute_context * ctx) {
+    ggml_vk_test_dequant_matmul(ctx, 128, 512, 512, 2, 100, 1, 0, GGML_TYPE_Q4_K);
+    /*
+    ggml_vk_test_dequant_matmul(ctx, 128, 512, 512, 2, 100, 1, 0, GGML_TYPE_Q6_K);
+    ggml_vk_test_dequant_matmul(ctx, 128, 512, 512, 2, 100, 1, 1, GGML_TYPE_Q6_K);
+    ggml_vk_test_dequant_matmul(ctx, 128, 512, 512, 2, 100, 1, 2, GGML_TYPE_Q6_K);
+    */
+}
+
 static void ggml_vk_graph_compute(struct ggml_kompute_context * ctx, struct ggml_cgraph * gf) {
     const int n_seq = 8;
 
     // FIXME: Figure out if we can somehow optimize the size of the pool... right now we're setting
     // it to the size of the graph, but I think it can be made smaller?
     ggml_vk_allocate_descriptor_pool(ctx, gf->n_nodes);
+
+    ggml_vk_run_tests(ctx);
+    GGML_ASSERT(0);
 
     std::vector<std::shared_ptr<kp::Sequence>> sequences(n_seq);
 
