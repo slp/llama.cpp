@@ -9123,7 +9123,8 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 model.ftype == LLAMA_FTYPE_MOSTLY_F16 ||
                 model.ftype == LLAMA_FTYPE_MOSTLY_BF16 ||
                 model.ftype == LLAMA_FTYPE_MOSTLY_Q4_0 ||
-                model.ftype == LLAMA_FTYPE_MOSTLY_Q4_1
+                model.ftype == LLAMA_FTYPE_MOSTLY_Q4_1 ||
+                model.ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M
             )
         )) {
             // TODO(cebtenzzre): propagate this error outside of llama_load_model_from_file
