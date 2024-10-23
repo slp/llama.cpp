@@ -1329,6 +1329,7 @@ static bool ggml_vk_supports_op(const struct ggml_tensor * op) {
         case GGML_TYPE_F32:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q6_K:
             break;
         default:
             return false;
