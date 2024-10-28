@@ -1076,8 +1076,42 @@ static void ggml_vk_mul_mat_q8_0(Args&&... args) {
     ggml_vk_mul_mat_impl(spirv, "q8_0", 1/*We access blocks unaligned*/, std::forward<Args>(args)...);
 }
 
+static void ggml_vk_print_matrix_area(const void * data, ggml_type type, int ne0, int ne1, int i0, int i1, int i2) {
+    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16) {
+        return;
+    }
+    i0 = std::max(i0, 5);
+    i1 = std::max(i1, 5);
+    i2 = std::max(i2, 0);
+    fprintf(stderr, "         ");
+    for (int idx1 = i1 - 5; idx1 < i1 + 5; idx1++) {
+        fprintf(stderr, "%7d ", idx1);
+    }
+    fprintf(stderr, "\n");
+    for (int idx0 = i0 - 5; idx0 < i0 + 5; idx0++) {
+        fprintf(stderr, "%7d: ", idx0);
+        for (int idx1 = i1 - 5; idx1 < i1 + 5; idx1++) {
+            if (idx0 >= 0 && idx0 < ne0 && idx1 >= 0 && idx1 < ne1) {
+                float val;
+                if (type == GGML_TYPE_F32) {
+                    val = *((const float *) data + i2*ne1*ne0 + idx1*ne0 + idx0);
+                } else if (type == GGML_TYPE_F16) {
+                    val = ggml_fp16_to_fp32(*((const ggml_fp16_t *) data + i2*ne1*ne0 + idx1*ne0 + idx0));
+                } else {
+                    GGML_ABORT("fatal error");
+                }
+                fprintf(stderr, "% 7.2f ", val);
+            } else {
+                fprintf(stderr, "        ");
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 static void ggml_vk_mul_mat_q4_k(
     kp::Sequence& seq,
+    ggml_tensor *gpu_src0, ggml_tensor *gpu_src1, ggml_tensor *gpu_dst,
     const std::shared_ptr<kp::Tensor>& inA,
     const std::shared_ptr<kp::Tensor>& inB,
     const std::shared_ptr<kp::Tensor>& out,
@@ -1107,7 +1141,106 @@ static void ggml_vk_mul_mat_q4_k(
         s_algo->setPushConstants<PushConstants>({pushConsts});
         s_algo->updateDescriptors(s_kompute_context->pool.get());
     }
+    //std::shared_ptr<kp::Sequence> localseq = komputeManager()->sequence();
     seq.record<kp::OpAlgoDispatch>(s_algo);
+    seq.evalAsync();
+    seq.evalAwait();
+    //localseq->evalAsync();
+    //localseq->evalAwait();
+#if 1
+    ggml_init_params iparams = {
+        /*.mem_size   =*/ 1024*1024*1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ggml_ctx = ggml_init(iparams);
+
+    ggml_tensor * src0 = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_Q4_K, ne00, ne01, ne02);
+    ggml_tensor * src1 = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, ne10, ne11, ne12);
+    ggml_tensor * dst = ggml_mul_mat(ggml_ctx, src0, src1);
+
+    size_t m = dst->ne[0];
+    size_t n = dst->ne[1];
+    size_t batch = dst->ne[2];
+
+    const size_t x_ne = ne00 * ne01 * ne02;
+    const size_t y_ne = ne10 * ne11 * ne12;
+    const size_t d_ne = dst->ne[0] * dst->ne[1] * dst->ne[2];
+
+    const size_t x_sz = sizeof(float) * x_ne;
+    const size_t y_sz = sizeof(float) * y_ne;
+    const size_t qx_sz = x_ne * ggml_type_size(GGML_TYPE_Q4_K)/ggml_blck_size(GGML_TYPE_Q4_K);
+    const size_t d_sz = sizeof(float) * d_ne;
+    float * x = (float *) malloc(x_sz);
+    float * y = (float *) malloc(y_sz);
+    void * qx = malloc(qx_sz);
+    float * d = (float *) malloc(d_sz);
+    float * d_chk = (float *) malloc(d_sz);
+
+    uint64_t offset;
+    komputeManager()->sequence()->eval<kp::OpTensorSyncLocal>({inA});
+    ggml_vk_memory *memory_inA = ggml_vk_find_tensor(gpu_src0, offset);
+    //fprintf(stderr, "offset=%ld\n", offset);
+    memcpy(qx, (const char*) memory_inA->data + offset, qx_sz);
+
+    komputeManager()->sequence()->eval<kp::OpTensorSyncLocal>({inB});
+    ggml_vk_memory *memory_inB = ggml_vk_find_tensor(gpu_src1, offset);
+    //fprintf(stderr, "offset=%ld\n", offset);
+    memcpy(y, (const char*) memory_inB->data + offset, y_sz);
+
+    src0->data = qx;
+    src1->data = y;
+    dst->data = d_chk;
+
+    ggml_cgraph * cgraph = ggml_new_graph(ggml_ctx);
+    ggml_build_forward_expand(cgraph, dst);
+
+    ggml_graph_compute_with_ctx(ggml_ctx, cgraph, 1);
+
+    ggml_free(ggml_ctx);
+
+    double avg_err = 0.0;
+    int first_err_n = -1;
+    int first_err_m = -1;
+    int first_err_b = -1;
+
+    komputeManager()->sequence()->eval<kp::OpTensorSyncLocal>({out});
+    ggml_vk_memory *memory_out = ggml_vk_find_tensor(gpu_dst, offset);
+    memcpy(d, (const char*) memory_out->data + offset, d_sz);
+
+    fprintf(stderr, "ggml_vk_mul_mat_q4_k(ne00=%d ne01=%d ne02=%d ne10=%d ne11=%d ne12=%d ne0=%d ne1=%d)\n", ne00, ne01, ne02, ne10, ne11, ne12, ne0, ne1);
+    //fprintf(stderr, "ggml_vk_mul_mat_q4_k(m=%d n=%d batch=%d)\n", m, n, batch);
+
+    for (size_t i = 0; i < m*n*batch; i++) {
+        double err = std::fabs(d[i] - d_chk[i]);
+        avg_err += err;
+
+        if (err > 0.05f && first_err_n == -1) {
+            first_err_b = i / (m * n);
+            first_err_n = (i % (m * n)) / m;
+            first_err_m = (i % (m * n)) % m;
+        }
+    }
+
+    avg_err /= m * n;
+
+    if (avg_err > 0.01 || std::isnan(avg_err)) {
+        std::cerr << "Avg_err=" << avg_err << "\n";
+        //std::cerr << "Actual result: " << std::endl << std::endl;
+        //ggml_vk_print_matrix_area(d, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
+        //std::cerr << "Expected result: " << std::endl << std::endl;
+        //ggml_vk_print_matrix_area(d_chk, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
+    } else {
+        std::cerr << "Looks okay\n";
+    }
+
+    free(x);
+    free(y);
+    free(qx);
+    free(d);
+    free(d_chk);
+#endif
 }
 
 static void ggml_vk_mul_mat_q6_k(
@@ -1451,7 +1584,7 @@ static bool ggml_vk_supports_op(const struct ggml_tensor * op) {
 }
 
 static void ggml_vk_graph_compute(struct ggml_kompute_context * ctx, struct ggml_cgraph * gf) {
-    const int n_seq = 8;
+    const int n_seq = 1;
 
     // FIXME: Figure out if we can somehow optimize the size of the pool... right now we're setting
     // it to the size of the graph, but I think it can be made smaller?
@@ -1494,7 +1627,7 @@ static void ggml_vk_graph_compute(struct ggml_kompute_context * ctx, struct ggml
                     break;
             }
 
-            any_commands_recorded = true;
+            //any_commands_recorded = true;
 
             if (!ggml_vk_supports_op(dst)) {
                  fprintf(stderr, "%s: error: unsupported op '%s'\n", __func__, ggml_op_desc(dst));
@@ -1542,6 +1675,8 @@ static void ggml_vk_graph_compute(struct ggml_kompute_context * ctx, struct ggml
             const std::shared_ptr<kp::Tensor>& id_src0 = src0 ? ggml_vk_get_tensor(src0, &off_src0) : nullTensor;
             const std::shared_ptr<kp::Tensor>& id_src1 = src1 ? ggml_vk_get_tensor(src1, &off_src1) : nullTensor;
             const std::shared_ptr<kp::Tensor>& id_dst  = dst  ? ggml_vk_get_tensor(dst,  &off_dst)  : nullTensor;
+
+            bool foobar = false;
 
             switch (dst->op) {
                 case GGML_OP_ADD:
@@ -1695,8 +1830,9 @@ static void ggml_vk_graph_compute(struct ggml_kompute_context * ctx, struct ggml
                                 );
                                 break;
                             case GGML_TYPE_Q4_K:
+                                foobar = true;
                                 ggml_vk_mul_mat_q4_k(
-                                    seq, id_src0, id_src1, id_dst, off_src0, off_src1, off_dst,
+                                    seq, src0, src1, dst, id_src0, id_src1, id_dst, off_src0, off_src1, off_dst,
                                     ne00, ne01, ne02, ne10, ne11, ne12, ne13, ne0, ne1, ne12/ne02, ne13/ne03
                                 );
                                 break;
@@ -1785,6 +1921,10 @@ static void ggml_vk_graph_compute(struct ggml_kompute_context * ctx, struct ggml
                         }
                     } break;
                 default: goto not_implemented;
+            }
+            if (!foobar) {
+                seq.evalAsync();
+                seq.evalAwait();
             }
             continue;
             not_implemented: {}
