@@ -848,9 +848,284 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context * ctx
     }
 }
 
+static void ggml_vk_print_matrix_area(const void * data, enum ggml_type type, int ne0, int ne1, int i0, int i1, int i2) {
+    if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16) {
+        return;
+    }
+    i0 = MAX(i0, 5);
+    i1 = MAX(i1, 5);
+    i2 = MAX(i2, 0);
+    fprintf(stderr, "         ");
+    for (int idx1 = i1 - 5; idx1 < i1 + 5; idx1++) {
+        fprintf(stderr, "%7d ", idx1);
+    }
+    fprintf(stderr, "\n");
+    for (int idx0 = i0 - 5; idx0 < i0 + 5; idx0++) {
+        fprintf(stderr, "%7d: ", idx0);
+        for (int idx1 = i1 - 5; idx1 < i1 + 5; idx1++) {
+            if (idx0 >= 0 && idx0 < ne0 && idx1 >= 0 && idx1 < ne1) {
+                float val;
+                if (type == GGML_TYPE_F32) {
+                    val = *((const float *) data + i2*ne1*ne0 + idx1*ne0 + idx0);
+                } else if (type == GGML_TYPE_F16) {
+                    val = ggml_fp16_to_fp32(*((const ggml_fp16_t *) data + i2*ne1*ne0 + idx1*ne0 + idx0));
+                } else {
+                    GGML_ABORT("fatal error");
+                }
+                fprintf(stderr, "% 7.2f ", val);
+            } else {
+                fprintf(stderr, "        ");
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+static void run_tests(struct ggml_backend_metal_context * ctx, size_t m, size_t n, size_t k, size_t batch, size_t num_it, size_t split_k, size_t shader_size, enum ggml_type quant) {
+    MTLComputePassDescriptor * edesc = MTLComputePassDescriptor.computePassDescriptor;
+    edesc.dispatchType = MTLDispatchTypeSerial;
+
+    const int n_cb = ctx->n_cb;
+
+    id<MTLCommandBuffer> command_buffer_builder[n_cb];
+    for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+        id<MTLCommandBuffer> command_buffer  = [ctx->queue commandBufferWithUnretainedReferences];
+        command_buffer_builder[cb_idx] = command_buffer;
+
+        // always enqueue the first two command buffers
+        // enqueue all of the command buffers if we don't need to abort
+        if (cb_idx < 2 || ctx->abort_callback == NULL) {
+            [command_buffer enqueue];
+        }
+    }
+
+    const id<MTLCommandBuffer> *command_buffers = command_buffer_builder;
+
+    id<MTLCommandBuffer> command_buffer  = command_buffers[0];
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoderWithDescriptor: edesc];
+
+    const size_t x_ne = m * k * batch;
+    const size_t y_ne = k * n * batch;
+    const size_t d_ne = m * n * batch;
+
+    const size_t x_sz = sizeof(float) * x_ne;
+    const size_t y_sz = sizeof(float) * y_ne;
+    const size_t qx_sz = x_ne * ggml_type_size(quant)/ggml_blck_size(quant);
+    const size_t d_sz = sizeof(float) * d_ne;
+    float * x = (float *) malloc(x_sz);
+    float * y = (float *) malloc(y_sz);
+    void * qx = malloc(qx_sz);
+    //vk_buffer qx_buf = ggml_vk_create_buffer_check(ctx->device, qx_sz, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    //vk_buffer y_buf = ggml_vk_create_buffer_check(ctx->device, y_sz, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    //vk_buffer d_buf = ggml_vk_create_buffer_check(ctx->device, d_sz, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    float * d = (float *) malloc(d_sz);
+    float * d_chk = (float *) malloc(d_sz);
+
+    for (size_t i = 0; i < x_ne; i++) {
+        x[i] = (rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+    }
+
+    ggml_quantize_chunk(quant, x, qx, 0, 1, x_ne, nil);
+
+    for (size_t i = 0; i < y_ne; i++) {
+        // y[i] = rand() / (float)RAND_MAX;
+        y[i] = (i % k == i / k) ? 1.0f : 0.0f;
+    }
+
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ 1024*1024*1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ggml_ctx = ggml_init(iparams);
+
+    struct ggml_tensor * src0 = ggml_new_tensor_3d(ggml_ctx, quant, k, m, batch);
+    struct ggml_tensor * src1 = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, k, n, batch);
+    struct ggml_tensor * dst = ggml_mul_mat(ggml_ctx, src0, src1);
+
+    //src0->buffer = ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_kompute_buffer_type(0), qx_sz);
+    //src1->buffer = ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_kompute_buffer_type(0), y_sz);
+    //dst->buffer = ggml_backend_kompute_buffer_type_alloc_buffer(ggml_backend_kompute_buffer_type(0), d_sz);
+
+/*
+    src0->data = qx;
+    src1->data = y;
+    dst->data = d;
+*/
+
+    const int32_t ne00 = src0 ? src0->ne[0] : 0;
+    const int32_t ne01 = src0 ? src0->ne[1] : 0;
+    const int32_t ne02 = src0 ? src0->ne[2] : 0;
+    const int32_t ne03 = src0 ? src0->ne[3] : 0;
+
+    const uint32_t nb00 = src0 ? src0->nb[0] : 0;
+    const uint32_t nb01 = src0 ? src0->nb[1] : 0;
+    const uint32_t nb02 = src0 ? src0->nb[2] : 0;
+    const uint32_t nb03 = src0 ? src0->nb[3] : 0;
+
+    const int32_t ne10 = src1 ? src1->ne[0] : 0;
+    const int32_t ne11 = src1 ? src1->ne[1] : 0;
+    const int32_t ne12 = src1 ? src1->ne[2] : 0;
+    const int32_t ne13 = src1 ? src1->ne[3] : 0;
+
+    const uint32_t nb10 = src1 ? src1->nb[0] : 0;
+    const uint32_t nb11 = src1 ? src1->nb[1] : 0;
+    const uint32_t nb12 = src1 ? src1->nb[2] : 0;
+    const uint32_t nb13 = src1 ? src1->nb[3] : 0;
+
+    const int32_t ne0 = dst ? dst->ne[0] : 0;
+    const int32_t ne1 = dst ? dst->ne[1] : 0;
+    const int32_t ne2 = dst ? dst->ne[2] : 0;
+//            const int32_t ne3 = dst ? dst->ne[3] : 0;
+
+    const uint32_t nb0 = dst ? dst->nb[0] : 0;
+    const uint32_t nb1 = dst ? dst->nb[1] : 0;
+    const uint32_t nb2 = dst ? dst->nb[2] : 0;
+    const uint32_t nb3 = dst ? dst->nb[3] : 0;
+
+    const uint32_t r2 = ne12/ne02;
+    const uint32_t r3 = ne13/ne03;
+
+    int ne11_mm_min = 1;
+
+    struct ggml_backend_metal_buffer src0_buf;
+    src0_buf.data = ggml_metal_host_malloc(qx_sz);
+    memcpy(src0_buf.data, qx, qx_sz);
+    src0_buf.size = qx_sz;
+    src0_buf.metal = [ctx->device newBufferWithBytesNoCopy:src0_buf.data
+                        length:qx_sz
+                        options:MTLResourceStorageModeShared
+                        deallocator:nil];
+
+    if (src0_buf.data == NULL || src0_buf.metal == nil) {
+        GGML_METAL_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, x_sz / 1024.0 / 1024.0);
+        return;
+    }
+
+    struct ggml_backend_metal_buffer src1_buf;
+    src1_buf.data = ggml_metal_host_malloc(y_sz);
+    memcpy(src1_buf.data, y, y_sz);
+    src1_buf.size = y_sz;
+    src1_buf.metal = [ctx->device newBufferWithBytesNoCopy:src1_buf.data
+                        length:y_sz
+                        options:MTLResourceStorageModeShared
+                        deallocator:nil];
+
+    if (src1_buf.data == NULL || src1_buf.metal == nil) {
+        GGML_METAL_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, y_sz / 1024.0 / 1024.0);
+        return;
+    }
+
+    struct ggml_backend_metal_buffer dst_buf;
+    dst_buf.data = ggml_metal_host_malloc(d_sz);
+    dst_buf.size = d_sz;
+    dst_buf.metal = [ctx->device newBufferWithBytesNoCopy:dst_buf.data
+                        length:d_sz
+                        options:MTLResourceStorageModeShared
+                        deallocator:nil];
+
+    if (dst_buf.data == NULL || dst_buf.metal == nil) {
+        GGML_METAL_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, d_sz / 1024.0 / 1024.0);
+        return;
+    }
+
+    id<MTLBuffer> id_src0 = src0_buf.metal;
+    id<MTLBuffer> id_src1 = src1_buf.metal;
+    id<MTLBuffer> id_dst  = dst_buf.metal;
+
+    int nth0 = 4; //1;
+    int nth1 = 8; //32;
+    id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_MUL_MV_Q4_K_F32].pipeline;
+
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:id_src0 offset:0 atIndex:0];
+    [encoder setBuffer:id_src1 offset:0 atIndex:1];
+    [encoder setBuffer:id_dst  offset:0  atIndex:2];
+    [encoder setBytes:&ne00 length:sizeof(ne00) atIndex:3];
+    [encoder setBytes:&ne01 length:sizeof(ne01) atIndex:4];
+    [encoder setBytes:&ne02 length:sizeof(ne02) atIndex:5];
+    [encoder setBytes:&nb00 length:sizeof(nb00) atIndex:6];
+    [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:7];
+    [encoder setBytes:&nb02 length:sizeof(nb02) atIndex:8];
+    [encoder setBytes:&ne10 length:sizeof(ne10) atIndex:9];
+    [encoder setBytes:&ne11 length:sizeof(ne11) atIndex:10];
+    [encoder setBytes:&ne12 length:sizeof(ne12) atIndex:11];
+    [encoder setBytes:&nb10 length:sizeof(nb10) atIndex:12];
+    [encoder setBytes:&nb11 length:sizeof(nb11) atIndex:13];
+    [encoder setBytes:&nb12 length:sizeof(nb12) atIndex:14];
+    [encoder setBytes:&ne0  length:sizeof(ne0)  atIndex:15];
+    [encoder setBytes:&ne1  length:sizeof(ne1)  atIndex:16];
+    [encoder setBytes:&r2   length:sizeof(r2)   atIndex:17];
+    [encoder setBytes:&r3   length:sizeof(r3)   atIndex:18];
+
+    [encoder dispatchThreadgroups:MTLSizeMake((ne01 + 3)/4, ne11, ne12*ne13) threadsPerThreadgroup:MTLSizeMake(nth0, nth1, 1)];
+
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+
+    MTLCommandBufferStatus status = [command_buffer status];
+    if (status != MTLCommandBufferStatusCompleted) {
+        GGML_METAL_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, 0, status);
+        if (status == MTLCommandBufferStatusError) {
+            NSString * error_code = [command_buffer error].localizedDescription;
+            GGML_METAL_LOG_INFO("error: %s\n", [error_code UTF8String]);
+        }
+        return;
+    }
+
+    struct ggml_tensor * src0_ggml = ggml_new_tensor_3d(ggml_ctx, quant, k, m, batch);
+    struct ggml_tensor * src1_ggml = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, k, n, batch);
+    struct ggml_tensor * tensor_ggml = ggml_mul_mat(ggml_ctx, src0_ggml, src1_ggml);
+
+    src0_ggml->data = qx;
+    src1_ggml->data = y;
+    tensor_ggml->data = d_chk;
+
+    struct ggml_cgraph * cgraph = ggml_new_graph(ggml_ctx);
+    ggml_build_forward_expand(cgraph, tensor_ggml);
+
+    ggml_graph_compute_with_ctx(ggml_ctx, cgraph, 1);
+
+    ggml_free(ggml_ctx);
+
+    double avg_err = 0.0;
+    int first_err_n = -1;
+    int first_err_m = -1;
+    int first_err_b = -1;
+
+    memcpy(d, (const char*) dst_buf.data, d_sz);
+
+    for (size_t i = 0; i < m*n*batch; i++) {
+        double err = fabs(d[i] - d_chk[i]);
+        avg_err += err;
+
+        if (err > 0.05f && first_err_n == -1) {
+            first_err_b = i / (m * n);
+            first_err_n = (i % (m * n)) / m;
+            first_err_m = (i % (m * n)) % m;
+        }
+    }
+
+    avg_err /= m * n;
+
+    if (avg_err > 0.01) {
+        fprintf(stderr, "Actual result:\n\n");
+        ggml_vk_print_matrix_area(d, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
+        fprintf(stderr, "Expected result:\n\n");
+        ggml_vk_print_matrix_area(d_chk, GGML_TYPE_F32, m, n, first_err_m, first_err_n, first_err_b);
+    } else {
+        fprintf(stderr, "Looks okay\n");
+    }
+}
+
 static enum ggml_status ggml_metal_graph_compute(
         struct ggml_backend_metal_context * ctx,
                struct ggml_cgraph * gf) {
+
+    run_tests(ctx, 128, 512, 512, 2, 100, 1, 0, GGML_TYPE_Q4_K);
+    GGML_ASSERT(0);
 
     @autoreleasepool {
     MTLComputePassDescriptor * edesc = MTLComputePassDescriptor.computePassDescriptor;
