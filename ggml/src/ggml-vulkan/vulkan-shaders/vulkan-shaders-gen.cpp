@@ -198,10 +198,15 @@ static uint32_t compile_count = 0;
 static std::mutex compile_count_mutex;
 static std::condition_variable compile_count_cond;
 
-void string_to_spv_func(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false) {
+void string_to_spv_func(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, bool is_embed = false) {
     std::string name = _name + (f16acc ? "_f16acc" : "") + (coopmat ? "_coopmat" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32"));
     std::string out_fname = join_paths(output_dir, name + ".spv");
-    std::string in_path = join_paths(input_dir, in_fname);
+    std::string in_path;
+    if (is_embed) {
+        in_path = join_paths(input_dir + "/../../ggml-kompute/kompute-shaders", in_fname);
+    } else {
+        in_path = join_paths(input_dir, in_fname);
+    }
 
     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
 
@@ -261,7 +266,7 @@ std::map<std::string, std::string> merge_maps(const std::map<std::string, std::s
 }
 
 static std::vector<std::future<void>> compiles;
-void string_to_spv(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false) {
+void string_to_spv(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, bool is_embed = false) {
     {
         // wait until fewer than N compiles are in progress.
         // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
@@ -272,7 +277,7 @@ void string_to_spv(const std::string& _name, const std::string& in_fname, const 
         }
         compile_count++;
     }
-    compiles.push_back(std::async(string_to_spv_func, _name, in_fname, defines, fp16, coopmat, coopmat2, f16acc));
+    compiles.push_back(std::async(string_to_spv_func, _name, in_fname, defines, fp16, coopmat, coopmat2, f16acc, is_embed));
 }
 
 void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool f16acc) {
@@ -489,6 +494,13 @@ void process_shaders() {
     string_to_spv("pool2d_f32", "pool2d.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     string_to_spv("rwkv_wkv6_f32", "wkv6.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+
+    string_to_spv("emb_mul_mat_mat_f32", "op_mul_mat_mat_f32.comp", {{"A_TYPE", "float"}}, true, false, false, false, true);
+    string_to_spv("emb_mul_mat_q4_0", "op_mul_mat_q4_0.comp", {{"A_TYPE", "float"}}, true, false, false, false, true);
+    string_to_spv("emb_mul_mat_q4_1", "op_mul_mat_q4_1.comp", {{"A_TYPE", "float"}}, true, false, false, false, true);
+    string_to_spv("emb_mul_mat_q4_k", "op_mul_mat_q4_k.comp", {{"A_TYPE", "float"}}, true, false, false, false, true);
+    string_to_spv("emb_mul_mat_q6_k", "op_mul_mat_q6_k.comp", {{"A_TYPE", "float"}}, true, false, false, false, true);
+    string_to_spv("emb_mul_mat_q8_0", "op_mul_mat_q8_0.comp", {{"A_TYPE", "float"}}, true, false, false, false, true);
 
     for (auto &c : compiles) {
         c.wait();

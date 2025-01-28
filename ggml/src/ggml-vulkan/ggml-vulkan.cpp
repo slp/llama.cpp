@@ -215,6 +215,14 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32;
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
+
+    vk_pipeline pipeline_emb_mul_mat_mat_f32;
+    vk_pipeline pipeline_emb_mul_mat_q4_0;
+    vk_pipeline pipeline_emb_mul_mat_q4_1;
+    vk_pipeline pipeline_emb_mul_mat_q4_k;
+    vk_pipeline pipeline_emb_mul_mat_q6_k;
+    vk_pipeline pipeline_emb_mul_mat_q8_0;
+
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_acc_f32;
@@ -1963,6 +1971,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_p021_f16_f32, "mul_mat_vec_p021_f16_f32", mul_mat_vec_p021_f16_f32_len, mul_mat_vec_p021_f16_f32_data, "main", 3, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", 3, 7 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_emb_mul_mat_mat_f32, "emb_mul_mat_mat_f32", emb_mul_mat_mat_f32_len, emb_mul_mat_mat_f32_data, "main", 3, 14 * sizeof(uint32_t), {1, 1, 1}, {device->subgroup_size}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_emb_mul_mat_q4_0, "emb_mul_mat_q4_0", emb_mul_mat_q4_0_len, emb_mul_mat_q4_0_data, "main", 3, 18 * sizeof(uint32_t), {1, 1, 1}, {(device->subgroup_size * 2) / 8}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_emb_mul_mat_q4_1, "emb_mul_mat_q4_1", emb_mul_mat_q4_1_len, emb_mul_mat_q4_1_data, "main", 3, 18 * sizeof(uint32_t), {1, 1, 1}, {(device->subgroup_size * 2) / 8}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_emb_mul_mat_q4_k, "emb_mul_mat_q4_k", emb_mul_mat_q4_k_len, emb_mul_mat_q4_k_data, "main", 3, 18 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_emb_mul_mat_q6_k, "emb_mul_mat_q6_k", emb_mul_mat_q6_k_len, emb_mul_mat_q6_k_data, "main", 3, 18 * sizeof(uint32_t), {1, 1, 1}, {2, device->subgroup_size}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_emb_mul_mat_q8_0, "emb_mul_mat_q8_0", emb_mul_mat_q8_0_len, emb_mul_mat_q8_0_data, "main", 3, 18 * sizeof(uint32_t), {1, 1, 1}, {(device->subgroup_size * 2) / 8}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -4355,6 +4370,148 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, src0, src1, dst, dryrun);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, dryrun);
+    }
+}
+
+static void ggml_vkemb_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
+    VK_LOG_DEBUG("ggml_vkemb_mul_mat(" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+    std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+    std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
+    std::cerr << "), " << (dryrun ? "dryrun" : "") << ")");
+
+    const uint64_t ne00 = src0->ne[0];
+    const uint64_t ne01 = src0->ne[1];
+    const uint64_t ne02 = src0->ne[2];
+    const uint64_t ne03 = src0->ne[3];
+
+    const uint64_t ne10 = src1->ne[0];
+    const uint64_t ne11 = src1->ne[1];
+    const uint64_t ne12 = src1->ne[2];
+    const uint64_t ne13 = src1->ne[3];
+
+    const uint64_t ne0 = dst->ne[0];
+    const uint64_t ne1 = dst->ne[1];
+
+    const uint64_t nb01 = src0->nb[1];
+    const uint64_t nb02 = src0->nb[2];
+    const uint64_t nb03 = src0->nb[2];
+
+    const uint64_t nb11 = src1->nb[1];
+    const uint64_t nb12 = src1->nb[2];
+    const uint64_t nb13 = src1->nb[3];
+
+    const uint64_t nb1 = dst->nb[1];
+    const uint64_t nb2 = dst->nb[2];
+
+    const uint64_t r2 = ne12 / ne02;
+    const uint64_t r3 = ne13 / ne03;
+
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+    ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+
+    vk_buffer d_Qy = nullptr;
+    size_t qy_buf_offset = 0;
+
+    bool src1_uma = false;
+
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
+        src1_uma = d_Qy != nullptr;
+    }
+
+    const uint64_t x_ne = ne00 * ne01 * ne02;
+    const uint64_t y_ne = ne10 * ne11 * ne12;
+    const uint64_t d_ne = ne01 * ne11 * ne12;
+
+    const uint64_t qx_sz = ggml_vk_align_size(ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type), ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
+    const uint64_t d_sz = sizeof(float) * d_ne;
+
+    vk_pipeline pipeline;
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            pipeline = ctx->device->pipeline_emb_mul_mat_mat_f32;
+            break;
+        case GGML_TYPE_Q4_0:
+            pipeline = ctx->device->pipeline_emb_mul_mat_q4_0;
+            break;
+        case GGML_TYPE_Q4_1:
+            pipeline = ctx->device->pipeline_emb_mul_mat_q4_1;
+            break;
+        case GGML_TYPE_Q4_K:
+            pipeline = ctx->device->pipeline_emb_mul_mat_q4_k;
+            break;
+        case GGML_TYPE_Q6_K:
+            pipeline = ctx->device->pipeline_emb_mul_mat_q6_k;
+            break;
+        case GGML_TYPE_Q8_0:
+            pipeline = ctx->device->pipeline_emb_mul_mat_q8_0;
+            break;
+        default:
+            GGML_ABORT("vkemb_mul_mat: unsupported quantization type: %d", src0->type);
+    }
+
+    if (dryrun) {
+        // Request descriptor sets
+        ggml_pipeline_request_descriptor_sets(ctx->device, pipeline, 1);
+        return;
+    }
+
+    vk_buffer d_D = dst_buf_ctx->dev_buffer;
+    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    GGML_ASSERT(d_D != nullptr);
+    vk_buffer d_Qx = src0_buf_ctx->dev_buffer;
+    const uint64_t qx_buf_offset = vk_tensor_offset(src0) + src0->view_offs;
+    GGML_ASSERT(d_Qx != nullptr);
+    if (!src1_uma) {
+        d_Qy = src1_buf_ctx->dev_buffer;
+        qy_buf_offset = vk_tensor_offset(src1) + src1->view_offs;
+        GGML_ASSERT(d_Qx != nullptr);
+    }
+
+    const uint64_t qy_buffer_offset = (qy_buf_offset / ctx->device->properties.limits.minStorageBufferOffsetAlignment) * ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t qy_shader_offset = qy_buf_offset - qy_buffer_offset;
+
+    const uint64_t d_buffer_offset = (d_buf_offset / ctx->device->properties.limits.minStorageBufferOffsetAlignment) * ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t d_shader_offset = d_buf_offset - d_buffer_offset;
+
+    // compute
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+            const std::array<uint32_t, 14> pc = { (uint32_t) 0, (uint32_t)(qy_shader_offset / ggml_type_size(src1->type)), (uint32_t)(d_shader_offset / ggml_type_size(dst->type)), (uint32_t)ne00, (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne11, (uint32_t)ne12, (uint32_t)nb01, (uint32_t) nb02, (uint32_t) nb11, (uint32_t) nb12, (uint32_t) nb1, (uint32_t) nb2 };
+            ggml_vk_sync_buffers(subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, 14 * sizeof(uint32_t), &pc, { (uint32_t) ne01, (uint32_t)ne11, (uint32_t)std::max(ne12, ne02) });
+            break;
+            }
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_0:
+            {
+            std::cerr << "qy_shader_offset=" << qy_shader_offset << "\n";
+            std::cerr << "d_shader_offset=" << d_shader_offset << "\n";
+            const std::array<uint32_t, 18> pc = { (uint32_t) 0, (uint32_t)(qy_shader_offset / ggml_type_size(src1->type)), (uint32_t)(d_shader_offset / ggml_type_size(dst->type)), (uint32_t)ne00, (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne10, (uint32_t)ne12, (uint32_t)ne0, (uint32_t) ne1, (uint32_t) nb01, (uint32_t) nb02, (uint32_t) nb03, (uint32_t) nb11, (uint32_t) nb12, (uint32_t) nb13, (uint32_t) r2, (uint32_t) r3 };
+            ggml_vk_sync_buffers(subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, 18 * sizeof(uint32_t), &pc, { ((uint32_t) ne01 + 7)/8, (uint32_t)ne11, (uint32_t)ne12 * (uint32_t)ne13 });
+            break;
+            }
+        case GGML_TYPE_Q4_K:
+            {
+            const std::array<uint32_t, 18> pc = { (uint32_t) 0, (uint32_t)(qy_shader_offset / ggml_type_size(src1->type)), (uint32_t)(d_shader_offset / ggml_type_size(dst->type)), (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne0, (uint32_t)ne1, (uint32_t)ne01, (uint32_t)ne02, (uint32_t) ne12, (uint32_t) nb01, (uint32_t) nb02, (uint32_t) nb03, (uint32_t) nb11, (uint32_t) nb12, (uint32_t) nb13, (uint32_t) r2, (uint32_t) r3 };
+            ggml_vk_sync_buffers(subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, 18 * sizeof(uint32_t), &pc, { ((uint32_t) ne01 + 3)/4, (uint32_t)ne11, (uint32_t)ne12 * (uint32_t)ne13 });
+            break;
+            }
+        case GGML_TYPE_Q6_K:
+            {
+            const std::array<uint32_t, 18> pc = { (uint32_t) 0, (uint32_t)(qy_shader_offset / ggml_type_size(src1->type)), (uint32_t)(d_shader_offset / ggml_type_size(dst->type)), (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne0, (uint32_t)ne1, (uint32_t)ne01, (uint32_t)ne02, (uint32_t) ne12, (uint32_t) nb01, (uint32_t) nb02, (uint32_t) nb03, (uint32_t) nb11, (uint32_t) nb12, (uint32_t) nb13, (uint32_t) r2, (uint32_t) r3 };
+            ggml_vk_sync_buffers(subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, 18 * sizeof(uint32_t), &pc, { ((uint32_t) ne01 + 1)/2, (uint32_t)ne11, (uint32_t)ne12 * (uint32_t)ne13 });
+            break;
+            }
+        default:
+            GGML_ABORT("vkemb_mul_mat: unsupported quantization type: %d", src0->type);
     }
 }
 
@@ -7073,8 +7230,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
 
         break;
     case GGML_OP_MUL_MAT:
-        ggml_vk_mul_mat(ctx, compute_ctx, src0, src1, node, dryrun);
-
+        switch (src0->type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q8_0:
+                ggml_vkemb_mul_mat(ctx, compute_ctx, src0, src1, node, dryrun);
+                break;
+            default:
+                ggml_vk_mul_mat(ctx, compute_ctx, src0, src1, node, dryrun);
+        }
         break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, src0, src1, src2, node, dryrun);
@@ -7879,8 +8046,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
             }
             break;
-        case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+            return false;
+        case GGML_OP_MUL_MAT:
             {
                 ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
                 const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -7891,23 +8059,25 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
-                    case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_K:
-                    case GGML_TYPE_Q6_K:
                     case GGML_TYPE_IQ4_NL:
+                        break;
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q6_K:
                         break;
                     default:
                         return false;
                 }
                 struct ggml_tensor * a;
                 struct ggml_tensor * b;
+
                 if (op->op == GGML_OP_MUL_MAT) {
                     a = op->src[0];
                     b = op->src[1];
